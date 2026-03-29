@@ -35,7 +35,7 @@ type MatchBuilderProps = {
   editSession?: MatchEditSession | null;
 };
 
-type Step = "idle" | "chooseTeams" | "chooseAuctionTeam" | "enterPlayerStats";
+type Step = "idle" | "chooseTeams" | "uploadScorecards" | "chooseAuctionTeam" | "enterPlayerStats";
 type NumericStatKey =
   | "runs"
   | "balls"
@@ -65,6 +65,40 @@ export type MatchEditSession = {
   venueSide: "team1" | "team2" | "";
   completedTeamIds: string[];
   draftByPlayerId: Record<string, MatchBuilderDraft>;
+};
+
+type UploadedScorecardFiles = {
+  inning1Batting: File | null;
+  inning1Bowling: File | null;
+  inning2Batting: File | null;
+  inning2Bowling: File | null;
+};
+
+type ExtractedPlayerStat = {
+  player_name: string;
+  batting?: {
+    runs?: number;
+    balls?: number;
+    fours?: number;
+    sixes?: number;
+    dismissed_for_duck?: boolean;
+  };
+  bowling?: {
+    overs?: number;
+    maidens?: number;
+    runs_conceded?: number;
+    wickets?: number;
+    dot_balls?: number;
+    lbw_bowled_wickets?: number;
+    wides?: number;
+    no_balls?: number;
+  };
+  fielding?: {
+    catches?: number;
+    stumpings?: number;
+    runout_direct?: number;
+    runout_assist?: number;
+  };
 };
 
 const defaultDraft: StatDraft = {
@@ -117,6 +151,25 @@ function labelFor(field: string): string {
   return labels[field] ?? field;
 }
 
+function normalizeName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function toDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        resolve(reader.result);
+        return;
+      }
+      reject(new Error("Failed to read file as data URL."));
+    };
+    reader.onerror = () => reject(new Error("Failed to read file."));
+    reader.readAsDataURL(file);
+  });
+}
+
 export function MatchBuilder({ iplTeams, auctionTeams, onDataChanged, editSession }: MatchBuilderProps) {
   const supabase = getSupabaseBrowserClient();
   const entryTopRef = useRef<HTMLDivElement | null>(null);
@@ -131,6 +184,13 @@ export function MatchBuilder({ iplTeams, auctionTeams, onDataChanged, editSessio
   const [completedTeamIds, setCompletedTeamIds] = useState<Set<string>>(new Set());
   const [isEditingExistingMatch, setIsEditingExistingMatch] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [analyzingScorecards, setAnalyzingScorecards] = useState(false);
+  const [scorecardFiles, setScorecardFiles] = useState<UploadedScorecardFiles>({
+    inning1Batting: null,
+    inning1Bowling: null,
+    inning2Batting: null,
+    inning2Bowling: null,
+  });
   const [message, setMessage] = useState("");
 
   const previewByAuctionTeam = useMemo(() => {
@@ -158,6 +218,21 @@ export function MatchBuilder({ iplTeams, auctionTeams, onDataChanged, editSessio
     requiredTeamCount > 0 &&
     previewByAuctionTeam.every((team) => completedTeamIds.has(team.id));
 
+  const selectedMatchPlayers = useMemo(() => {
+    const byId = new Map<string, (typeof auctionTeams)[number]["players"][number]>();
+    for (const team of auctionTeams) {
+      for (const player of team.players) {
+        if (player.ipl_team_id !== selectedTeam1 && player.ipl_team_id !== selectedTeam2) {
+          continue;
+        }
+        if (!byId.has(player.id)) {
+          byId.set(player.id, player);
+        }
+      }
+    }
+    return [...byId.values()];
+  }, [auctionTeams, selectedTeam1, selectedTeam2]);
+
   function focusEntryTop() {
     requestAnimationFrame(() => {
       entryTopRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -174,6 +249,13 @@ export function MatchBuilder({ iplTeams, auctionTeams, onDataChanged, editSessio
     setCurrentMatchId(null);
     setCompletedTeamIds(new Set());
     setIsEditingExistingMatch(false);
+    setAnalyzingScorecards(false);
+    setScorecardFiles({
+      inning1Batting: null,
+      inning1Bowling: null,
+      inning2Batting: null,
+      inning2Bowling: null,
+    });
   }
 
   async function cancelCalculation() {
@@ -265,12 +347,15 @@ export function MatchBuilder({ iplTeams, auctionTeams, onDataChanged, editSessio
     setCurrentMatchId(match.id);
     setIsEditingExistingMatch(false);
     setCompletedTeamIds(new Set());
-    if (previewByAuctionTeam[0]) {
-      setActiveAuctionTeamId(previewByAuctionTeam[0].id);
-    }
+    setScorecardFiles({
+      inning1Batting: null,
+      inning1Bowling: null,
+      inning2Batting: null,
+      inning2Bowling: null,
+    });
     setSaving(false);
-    setMessage("Draft created. Now choose an auction team.");
-    setStep("chooseAuctionTeam");
+    setMessage("Draft created. Upload scorecards for auto-prefill, or skip.");
+    setStep("uploadScorecards");
     await onDataChanged();
   }
 
@@ -330,6 +415,155 @@ export function MatchBuilder({ iplTeams, auctionTeams, onDataChanged, editSessio
         return merged;
       })(),
     }));
+  }
+
+  function continueToAuctionTeams() {
+    if (previewByAuctionTeam[0]) {
+      setActiveAuctionTeamId(previewByAuctionTeam[0].id);
+    }
+    setStep("chooseAuctionTeam");
+    setMessage("Proceeding to auction teams. You can edit and save team-wise as usual.");
+  }
+
+  function applyExtractedPlayerStats(extractedPlayers: ExtractedPlayerStat[]) {
+    const playerIdByNormalizedName = new Map<string, string>();
+    for (const player of selectedMatchPlayers) {
+      playerIdByNormalizedName.set(normalizeName(player.player_name), player.id);
+    }
+
+    setDraftByPlayerId((prev) => {
+      const next = { ...prev };
+
+      for (const extracted of extractedPlayers) {
+        const key = normalizeName(extracted.player_name ?? "");
+        const playerId = playerIdByNormalizedName.get(key);
+        if (!playerId) {
+          continue;
+        }
+
+        const current = next[playerId] ?? defaultDraft;
+        const merged: StatDraft = {
+          ...current,
+          runs: Math.max(0, Number(extracted.batting?.runs ?? current.runs)),
+          balls: Math.max(0, Number(extracted.batting?.balls ?? current.balls)),
+          fours: Math.max(0, Number(extracted.batting?.fours ?? current.fours)),
+          sixes: Math.max(0, Number(extracted.batting?.sixes ?? current.sixes)),
+          dismissed_for_duck: Boolean(extracted.batting?.dismissed_for_duck ?? current.dismissed_for_duck),
+          overs: Math.max(0, Number(extracted.bowling?.overs ?? current.overs)),
+          maidens: Math.max(0, Number(extracted.bowling?.maidens ?? current.maidens)),
+          runs_conceded: Math.max(0, Number(extracted.bowling?.runs_conceded ?? current.runs_conceded)),
+          wickets: Math.max(0, Number(extracted.bowling?.wickets ?? current.wickets)),
+          dot_balls: Math.max(0, Number(extracted.bowling?.dot_balls ?? current.dot_balls)),
+          lbw_bowled_wickets: Math.max(
+            0,
+            Number(extracted.bowling?.lbw_bowled_wickets ?? current.lbw_bowled_wickets),
+          ),
+          wides: Math.max(0, Number(extracted.bowling?.wides ?? current.wides)),
+          no_balls: Math.max(0, Number(extracted.bowling?.no_balls ?? current.no_balls)),
+          catches: Math.max(0, Number(extracted.fielding?.catches ?? current.catches)),
+          stumpings: Math.max(0, Number(extracted.fielding?.stumpings ?? current.stumpings)),
+          runout_direct: Math.max(0, Number(extracted.fielding?.runout_direct ?? current.runout_direct)),
+          runout_assist: Math.max(0, Number(extracted.fielding?.runout_assist ?? current.runout_assist)),
+          played: current.played,
+          is_captain: current.is_captain,
+          is_vice_captain: current.is_vice_captain,
+        };
+
+        const hasContribution =
+          merged.dismissed_for_duck ||
+          merged.runs > 0 ||
+          merged.balls > 0 ||
+          merged.fours > 0 ||
+          merged.sixes > 0 ||
+          merged.overs > 0 ||
+          merged.maidens > 0 ||
+          merged.runs_conceded > 0 ||
+          merged.wickets > 0 ||
+          merged.dot_balls > 0 ||
+          merged.lbw_bowled_wickets > 0 ||
+          merged.wides > 0 ||
+          merged.no_balls > 0 ||
+          merged.catches > 0 ||
+          merged.stumpings > 0 ||
+          merged.runout_direct > 0 ||
+          merged.runout_assist > 0;
+
+        merged.played = merged.played || hasContribution;
+        next[playerId] = merged;
+      }
+      return next;
+    });
+  }
+
+  async function analyzeUploadedScorecards() {
+    if (!currentMatchId) {
+      setMessage("Create the draft match first.");
+      return;
+    }
+    const requiredFiles = [
+      scorecardFiles.inning1Batting,
+      scorecardFiles.inning1Bowling,
+      scorecardFiles.inning2Batting,
+      scorecardFiles.inning2Bowling,
+    ];
+    if (requiredFiles.some((file) => !file)) {
+      setMessage("Upload all 4 screenshots (batting + bowling for both innings) or skip.");
+      return;
+    }
+
+    setAnalyzingScorecards(true);
+    setMessage("Analyzing screenshots with Gemini...");
+
+    try {
+      const [inning1Batting, inning1Bowling, inning2Batting, inning2Bowling] = await Promise.all(
+        requiredFiles.map((file) => toDataUrl(file as File)),
+      );
+
+      const response = await fetch("/api/scorecard/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          selectedTeam1,
+          selectedTeam2,
+          players: selectedMatchPlayers.map((player) => ({
+            id: player.id,
+            player_name: player.player_name,
+            ipl_team_short_code: player.ipl_team.short_code,
+          })),
+          screenshots: {
+            inning1Batting,
+            inning1Bowling,
+            inning2Batting,
+            inning2Bowling,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(payload?.error ?? "Failed to extract scorecard stats.");
+      }
+
+      const payload = (await response.json()) as {
+        players?: ExtractedPlayerStat[];
+        warnings?: string[];
+      };
+      const extractedPlayers = payload.players ?? [];
+      applyExtractedPlayerStats(extractedPlayers);
+      continueToAuctionTeams();
+      if ((payload.warnings ?? []).length > 0) {
+        setMessage(
+          `Prefill completed with ${payload.warnings?.length ?? 0} warning(s). Review player rows before saving.`,
+        );
+      } else {
+        setMessage("Prefill completed. Review each auction team and click save.");
+      }
+    } catch (error) {
+      const fallback = "Could not analyze screenshots right now. You can skip and enter stats manually.";
+      setMessage(error instanceof Error ? error.message || fallback : fallback);
+    } finally {
+      setAnalyzingScorecards(false);
+    }
   }
 
   async function saveActiveTeam() {
@@ -582,10 +816,79 @@ export function MatchBuilder({ iplTeams, auctionTeams, onDataChanged, editSessio
         </div>
       ) : null}
 
+      {step === "uploadScorecards" ? (
+        <div className="space-y-3 rounded-xl border border-zinc-700 bg-zinc-950/60 p-4">
+          <p className="text-sm text-zinc-300">
+            Step 3: Upload scoreboard screenshots for both innings (optional auto-prefill).
+          </p>
+          <div className="grid gap-3 md:grid-cols-2">
+            {(
+              [
+                { key: "inning1Batting", label: "Inning 1 - Batting card" },
+                { key: "inning1Bowling", label: "Inning 1 - Bowling card" },
+                { key: "inning2Batting", label: "Inning 2 - Batting card" },
+                { key: "inning2Bowling", label: "Inning 2 - Bowling card" },
+              ] as const
+            ).map((item) => (
+              <label
+                key={item.key}
+                className="rounded-xl border border-zinc-700 bg-zinc-900/50 p-3 text-xs text-zinc-300"
+              >
+                {item.label}
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0] ?? null;
+                    setScorecardFiles((prev) => ({ ...prev, [item.key]: file }));
+                  }}
+                  className="mt-2 block w-full text-xs text-zinc-300 file:mr-3 file:rounded-full file:border-0 file:bg-indigo-500 file:px-3 file:py-1 file:text-xs file:font-semibold file:text-white"
+                />
+                <p className="mt-2 text-[11px] text-zinc-400">
+                  {scorecardFiles[item.key]?.name ?? "No file selected"}
+                </p>
+              </label>
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => setStep("chooseTeams")}
+              className="rounded-full border border-zinc-600 px-4 py-2 text-sm font-semibold text-zinc-100"
+            >
+              Back
+            </button>
+            <button
+              type="button"
+              onClick={() => void analyzeUploadedScorecards()}
+              disabled={analyzingScorecards || saving}
+              className="rounded-full bg-indigo-500 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {analyzingScorecards ? "Analyzing..." : "Analyze & Prefill"}
+            </button>
+            <button
+              type="button"
+              onClick={continueToAuctionTeams}
+              disabled={analyzingScorecards}
+              className="rounded-full border border-emerald-500 px-4 py-2 text-sm font-semibold text-emerald-300 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Skip for now
+            </button>
+            <button
+              type="button"
+              onClick={() => void cancelCalculation()}
+              className="rounded-full border border-rose-500/60 px-4 py-2 text-sm font-semibold text-rose-300"
+            >
+              Cancel Calculation
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {step === "chooseAuctionTeam" ? (
         <div className="space-y-3 rounded-xl border border-zinc-700 bg-zinc-950/60 p-4">
           <p className="text-sm text-zinc-300">
-            Step 3: Choose your auction team.
+            Step 4: Choose your auction team.
           </p>
           {previewByAuctionTeam.length === 0 ? (
             <p className="rounded-xl border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-400">
@@ -668,7 +971,7 @@ export function MatchBuilder({ iplTeams, auctionTeams, onDataChanged, editSessio
         <>
           <div ref={entryTopRef} className="flex items-center justify-between gap-2">
             <p className="text-sm text-zinc-300">
-              Step 4: Enter stats player-by-player for{" "}
+              Step 5: Enter stats player-by-player for{" "}
               <span className="font-semibold">{activeAuctionTeam?.team_name}</span>.
             </p>
             <div className="flex items-center gap-2">
