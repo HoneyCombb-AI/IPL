@@ -335,7 +335,7 @@ export async function getStatsPageData(): Promise<StatsPageData> {
     current.totalPoints += totalPoints;
     current.matchesPlayed += 1;
     current.bestPoints = Math.max(current.bestPoints, totalPoints);
-    if (totalPoints >= 50) {
+    if (totalPoints >= 50 && totalPoints < 100) {
       current.games50Plus += 1;
     }
     if (totalPoints >= 100) {
